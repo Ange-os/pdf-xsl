@@ -1,0 +1,17 @@
+# Servidor web
+Flask==3.0.2
+python-dotenv>=1.0.0
+
+# Datos y Excel
+pandas>=2.2.0
+openpyxl>=3.1.0
+
+# PDF (páginas, imágenes)
+pdfplumber>=0.10.0
+pymupdf>=1.24.0
+
+# Modo V3 (IA)
+groq>=0.4.0
+
+# Retab (API)
+requests>=2.28.0

@@ -1,0 +1,26 @@
+# Entorno virtual
+venv/
+.venv/
+env/
+.env.example
+
+# Variables de entorno (contiene API keys)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+ 
+ .cursor/
+ __pycache__
+ GEMINI_API_KEY.md
+ test_converter.py 
