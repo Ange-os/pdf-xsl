@@ -39,6 +39,16 @@ python app.py
 
 Abre http://127.0.0.1:5000, sube un PDF y elige **Convertir con V3** o **Convertir con Retab**. La descarga será un Excel con una hoja por página.
 
+### Uso desde aplicación de escritorio (API con progreso)
+
+Para integrar desde FoxPro, .NET u otra app de escritorio: se usa un flujo asíncrono con **progreso en porcentaje** y protección por **API Key**. Detalle completo en **[API-USO.md](API-USO.md)**.
+
+- **POST /convert-v3/job** → envías el PDF con la cabecera `X-API-Key`; respuesta `job_id` y `total_pages`.
+- **GET /convert-v3/job/<job_id>/status** → consultas cada poco; respuesta `progress` (0–100), `message`, `status` (processing/completed/failed).
+- **GET /convert-v3/job/<job_id>/result** → cuando `status` es `completed`, descargas el Excel.
+
+En el servidor se configura `PDF2XLS_API_KEY` en `.env`; la misma clave la usa la app de escritorio en cada petición.
+
 ---
 
 ## Estructura del proyecto

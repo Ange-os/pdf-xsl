@@ -7,17 +7,37 @@ try:
 except ImportError:
     pass
 
-from flask import Flask, request, send_file, render_template_string
+from flask import Flask, request, send_file, render_template_string, jsonify
 import base64
 import io
 import os
 import re
 import tempfile
+import threading
+import uuid
 
 import pandas as pd
 import pdfplumber
 
 app = Flask(__name__)
+
+# API Key para endpoints de escritorio (solo quien tenga la clave puede usar /convert-v3/job/*)
+PDF2XLS_API_KEY = (os.environ.get("PDF2XLS_API_KEY") or "").strip().strip('"\'')
+# Jobs asíncronos: job_id -> { status, progress, current_page, total_pages, message, result_bytes, filename, error }
+_JOBS = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _require_api_key():
+    """Comprueba X-API-Key o Authorization: Bearer. Retorna (True, None) o (False, response_401)."""
+    if not PDF2XLS_API_KEY:
+        return False, (jsonify({"error": "PDF2XLS_API_KEY no configurada en el servidor"}), 500)
+    key = request.headers.get("X-API-Key") or ""
+    if not key and request.headers.get("Authorization", "").startswith("Bearer "):
+        key = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if key != PDF2XLS_API_KEY:
+        return False, (jsonify({"error": "API key inválida o faltante"}), 401)
+    return True, None
 
 # Patrones para filter_data_rows (usado por Retab)
 PRICE_PATTERN = re.compile(r"\$[\d.]+")
@@ -58,6 +78,21 @@ def _row_has_data_indicator(row_text):
     if re.search(r"\b\d{4,}\b", s):  # código 279000, 9936004, EAN, etc.
         return True
     return False
+
+
+def _v3_df_to_excel_single_sheet(df):
+    """
+    Genera un Excel con una sola hoja 'Principal' con todas las filas del DataFrame.
+    No incluye la columna Página en el archivo final. Sin IA, solo pandas/openpyxl.
+    """
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        if df is not None and not df.empty:
+            out = df.drop(columns=["Página"], errors="ignore")
+            out.to_excel(writer, sheet_name="Principal", index=False)
+        else:
+            pd.DataFrame().to_excel(writer, sheet_name="Principal", index=False)
+    return output.getvalue()
 
 
 def filter_data_rows(df):
@@ -104,6 +139,151 @@ UPLOAD_FORM = """
       <br><br>
       <button type="submit">Convertir con Retab</button>
     </form>
+    <hr>
+    <p><a href="/convert-v3/test">Probar API (job + API Key + progreso)</a></p>
+  </body>
+</html>
+"""
+
+
+API_TEST_PAGE = """
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <title>Probar API (job + progreso)</title>
+    <style>
+      body { font-family: sans-serif; max-width: 520px; margin: 2rem auto; padding: 0 1rem; }
+      label { display: block; margin-top: 1rem; font-weight: bold; }
+      input[type="password"], input[type="file"] { margin-top: 0.25rem; width: 100%; }
+      button { margin-top: 1rem; padding: 0.5rem 1rem; cursor: pointer; }
+      #jobId { font-family: monospace; background: #f0f0f0; padding: 0.5rem; word-break: break-all; margin-top: 0.25rem; }
+      #progressArea { margin-top: 1rem; display: none; }
+      #progressBar { width: 100%; height: 24px; margin: 0.5rem 0; }
+      #progressMsg { color: #666; font-size: 0.9rem; }
+      #downloadArea { margin-top: 1rem; display: none; }
+      .error { color: #c00; }
+    </style>
+  </head>
+  <body>
+    <h2>Probar API (job + API Key)</h2>
+    <p>Envía un PDF al endpoint <code>/convert-v3/job</code> y sigue el progreso por <code>job_id</code>.</p>
+    <label>API Key (PDF2XLS_API_KEY)</label>
+    <input type="password" id="apiKey" placeholder="Pega aquí la clave">
+    <label>Archivo PDF</label>
+    <input type="file" id="pdfFile" accept=".pdf">
+    <button type="button" id="btnStart">Enviar y seguir progreso</button>
+
+    <div id="jobArea" style="display: none;">
+      <label>job_id</label>
+      <div id="jobId"></div>
+    </div>
+    <div id="progressArea">
+      <label>Progreso</label>
+      <progress id="progressBar" value="0" max="100">0%</progress>
+      <div id="progressMsg"></div>
+    </div>
+    <div id="downloadArea">
+      <a id="downloadLink" href="#" download>Descargar Excel</a>
+    </div>
+    <div id="errorArea" class="error"></div>
+
+    <script>
+      const apiKey = document.getElementById('apiKey');
+      const pdfFile = document.getElementById('pdfFile');
+      const btnStart = document.getElementById('btnStart');
+      const jobArea = document.getElementById('jobArea');
+      const jobIdEl = document.getElementById('jobId');
+      const progressArea = document.getElementById('progressArea');
+      const progressBar = document.getElementById('progressBar');
+      const progressMsg = document.getElementById('progressMsg');
+      const downloadArea = document.getElementById('downloadArea');
+      const downloadLink = document.getElementById('downloadLink');
+      const errorArea = document.getElementById('errorArea');
+
+      function showError(msg) {
+        errorArea.textContent = msg;
+      }
+      function clearError() {
+        errorArea.textContent = '';
+      }
+
+      btnStart.addEventListener('click', async function() {
+        const key = apiKey.value.trim();
+        const file = pdfFile.files[0];
+        clearError();
+        jobArea.style.display = 'none';
+        downloadArea.style.display = 'none';
+        progressArea.style.display = 'block';
+        progressBar.value = 0;
+        progressMsg.textContent = '';
+
+        if (!key) {
+          showError('Escribe la API Key.');
+          return;
+        }
+        if (!file) {
+          showError('Elige un archivo PDF.');
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append('file', file);
+        const headers = { 'X-API-Key': key };
+
+        try {
+          const res = await fetch('/convert-v3/job', { method: 'POST', headers, body: formData });
+          const data = await res.json().catch(() => ({}));
+          if (res.status === 401) {
+            showError('API Key inválida o faltante.');
+            return;
+          }
+          if (res.status !== 202) {
+            showError(data.error || 'Error al crear el job. ' + res.status);
+            return;
+          }
+          const id = data.job_id;
+          jobIdEl.textContent = id;
+          jobArea.style.display = 'block';
+          progressMsg.textContent = 'Iniciando... (0/' + (data.total_pages || '?') + ')';
+
+          const poll = setInterval(async () => {
+            const sRes = await fetch('/convert-v3/job/' + id + '/status', { headers: { 'X-API-Key': key } });
+            const sData = await sRes.json().catch(() => ({}));
+            if (sRes.status !== 200) {
+              clearInterval(poll);
+              showError(sData.error || 'Error al consultar estado.');
+              return;
+            }
+            progressBar.value = sData.progress || 0;
+            progressMsg.textContent = (sData.message || '') + ' (' + (sData.progress || 0) + '%)';
+            if (sData.status === 'completed') {
+              clearInterval(poll);
+              progressMsg.textContent = 'Listo. Haz clic en "Descargar Excel".';
+              downloadLink.onclick = function(e) {
+                e.preventDefault();
+                fetch('/convert-v3/job/' + id + '/result', { headers: { 'X-API-Key': key } })
+                  .then(r => r.blob())
+                  .then(blob => {
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = (file.name || 'catalogo').replace(/\\.pdf$/i, '') + '_v3.xlsx';
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                  })
+                  .catch(err => showError('Error al descargar: ' + err.message));
+              };
+              downloadArea.style.display = 'block';
+            } else if (sData.status === 'failed') {
+              clearInterval(poll);
+              showError('Error: ' + (sData.error || 'unknown'));
+            }
+          }, 1500);
+        } catch (e) {
+          showError('Error de red: ' + e.message);
+        }
+      });
+    </script>
   </body>
 </html>
 """
@@ -112,6 +292,12 @@ UPLOAD_FORM = """
 @app.route("/")
 def index():
     return render_template_string(UPLOAD_FORM)
+
+
+@app.route("/convert-v3/test")
+def convert_v3_test_page():
+    """Página para probar el endpoint asíncrono con API Key y visualización de job_id y progreso."""
+    return render_template_string(API_TEST_PAGE)
 
 
 @app.route("/convert-v3", methods=["POST"])
@@ -147,36 +333,165 @@ def convert_pdf_to_xls_v3():
         print(f"[CONVERT-V3] ✓ Extracción completada. Total filas: {total_rows}", flush=True)
         _sys.stdout.flush()
 
-        sheets = {}
-        if df is not None and not df.empty and "Página" in df.columns:
-            for page_num, group in df.groupby("Página", sort=True):
-                group_clean = group.drop(columns=["Página"], errors="ignore")
-                if not group_clean.empty:
-                    sheets[int(page_num)] = group_clean
-        elif df is not None and not df.empty:
-            sheets[1] = df
-
     finally:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        if sheets:
-            for page_num in sorted(sheets.keys()):
-                df_page = sheets[page_num]
-                sheet_name = f"Pág {page_num}"[:31]
-                df_page.to_excel(writer, sheet_name=sheet_name, index=False)
-        else:
-            pd.DataFrame().to_excel(writer, sheet_name="Vacío", index=False)
-
-    output.seek(0)
+    excel_bytes = _v3_df_to_excel_single_sheet(df)
     return send_file(
-        output,
+        io.BytesIO(excel_bytes),
         as_attachment=True,
         download_name="catalogo_v3.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def _run_job(job_id, tmp_path, num_pages, filename_pdf):
+    """Ejecuta la conversión en segundo plano y actualiza el job con progreso y resultado."""
+    import sys as _sys
+    try:
+        from pdf_converter_ai_v3 import extract_with_groq_ai_v3
+
+        def on_progress(current_page, total_pages, progress_pct, message):
+            with _JOBS_LOCK:
+                if job_id not in _JOBS:
+                    return
+                _JOBS[job_id]["current_page"] = current_page
+                _JOBS[job_id]["total_pages"] = total_pages
+                _JOBS[job_id]["progress"] = progress_pct
+                _JOBS[job_id]["message"] = message
+
+        df = extract_with_groq_ai_v3(
+            tmp_path,
+            list(range(1, num_pages + 1)),
+            debug_zero=True,
+            progress_callback=on_progress,
+        )
+
+        with _JOBS_LOCK:
+            if job_id not in _JOBS:
+                return
+            if df is None or df.empty:
+                _JOBS[job_id]["status"] = "completed"
+                _JOBS[job_id]["progress"] = 100
+                _JOBS[job_id]["message"] = "Sin datos extraídos"
+                _JOBS[job_id]["result_bytes"] = None
+                return
+            excel_bytes = _v3_df_to_excel_single_sheet(df)
+            _JOBS[job_id]["status"] = "completed"
+            _JOBS[job_id]["progress"] = 100
+            _JOBS[job_id]["message"] = "Listo"
+            _JOBS[job_id]["result_bytes"] = excel_bytes
+            _JOBS[job_id]["filename"] = (filename_pdf or "catalogo").replace(".pdf", "") + "_v3.xlsx"
+    except Exception as e:
+        with _JOBS_LOCK:
+            if job_id in _JOBS:
+                _JOBS[job_id]["status"] = "failed"
+                _JOBS[job_id]["error"] = str(e)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+@app.route("/convert-v3/job", methods=["POST"])
+def convert_v3_job_create():
+    """
+    Inicia una conversión en segundo plano (para app de escritorio).
+    Requiere cabecera: X-API-Key: <tu_clave> o Authorization: Bearer <tu_clave>
+    Body: multipart/form-data con campo "file" (PDF).
+    Respuesta 202: { "job_id": "...", "total_pages": N }. Luego consultar estado y resultado.
+    """
+    ok, err = _require_api_key()
+    if not ok:
+        return err[0], err[1]
+    pdf_file = request.files.get("file")
+    if not pdf_file:
+        return jsonify({"error": "Falta el archivo PDF (campo 'file')"}), 400
+    groq_ok = bool((os.environ.get("GROQ_API_KEY") or "").strip())
+    if not groq_ok:
+        return jsonify({"error": "GROQ_API_KEY no configurada en el servidor"}), 400
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_file.read())
+        tmp_path = tmp.name
+    try:
+        with pdfplumber.open(tmp_path) as pdf:
+            num_pages = len(pdf.pages)
+    except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return jsonify({"error": f"No se pudo leer el PDF: {e}"}), 400
+
+    job_id = str(uuid.uuid4())
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {
+            "status": "processing",
+            "progress": 0,
+            "current_page": 0,
+            "total_pages": num_pages,
+            "message": "Iniciando...",
+            "result_bytes": None,
+            "filename": "catalogo_v3.xlsx",
+            "error": None,
+        }
+    t = threading.Thread(target=_run_job, args=(job_id, tmp_path, num_pages, pdf_file.filename or ""))
+    t.daemon = True
+    t.start()
+    return jsonify({"job_id": job_id, "total_pages": num_pages}), 202
+
+
+@app.route("/convert-v3/job/<job_id>/status", methods=["GET"])
+def convert_v3_job_status(job_id):
+    """
+    Consulta el estado de un job. Requiere X-API-Key o Authorization: Bearer.
+    Respuesta: { "status": "processing"|"completed"|"failed", "progress": 0-100, "current_page", "total_pages", "message" [, "error" ] }.
+    """
+    ok, err = _require_api_key()
+    if not ok:
+        return err[0], err[1]
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "Job no encontrado"}), 404
+    out = {
+        "status": job["status"],
+        "progress": job["progress"],
+        "current_page": job["current_page"],
+        "total_pages": job["total_pages"],
+        "message": job["message"],
+    }
+    if job.get("error"):
+        out["error"] = job["error"]
+    return jsonify(out)
+
+
+@app.route("/convert-v3/job/<job_id>/result", methods=["GET"])
+def convert_v3_job_result(job_id):
+    """
+    Descarga el Excel cuando el job está completado. Requiere X-API-Key o Authorization: Bearer.
+    Si status no es "completed", responde 404.
+    """
+    ok, err = _require_api_key()
+    if not ok:
+        return err[0], err[1]
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "Job no encontrado"}), 404
+    if job["status"] != "completed":
+        return jsonify({"error": "El job aún no ha terminado", "status": job["status"]}), 404
+    if not job.get("result_bytes"):
+        return jsonify({"error": "No se generó archivo (sin datos)"}), 404
+    return send_file(
+        io.BytesIO(job["result_bytes"]),
+        as_attachment=True,
+        download_name=job.get("filename", "catalogo_v3.xlsx"),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 

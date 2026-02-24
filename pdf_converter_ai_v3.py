@@ -15,6 +15,42 @@ import sys
 
 import pandas as pd
 
+# Base URL de prompts: solo desde .env (no se expone en código)
+PROMPTS_BASE_URL = (os.environ.get("PROMPTS_BASE_URL") or "").strip().rstrip("/")
+_PROMPT_CACHE = {}  # caché en memoria para evitar peticiones repetidas
+_PROMPTS_DEBUG = (os.environ.get("PROMPTS_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on")
+_PROMPT_SOURCE_LOGGED = set()  # para no repetir el mensaje en cada página
+
+
+def _log_prompt_source(prompt_name, from_vps):
+    """Si PROMPTS_DEBUG está activo, muestra una vez por ejecución si el prompt viene del VPS o del fallback."""
+    if not _PROMPTS_DEBUG or prompt_name in _PROMPT_SOURCE_LOGGED:
+        return
+    _PROMPT_SOURCE_LOGGED.add(prompt_name)
+    source = "VPS" if from_vps else "fallback"
+    print(f"[V3] Prompts: {prompt_name} → {source}", flush=True)
+    sys.stdout.flush()
+
+
+def _load_prompt(filename, verify_ssl=True):
+    """Carga el contenido de un .md desde el VPS. Usa caché. Si no hay PROMPTS_BASE_URL o falla, retorna None."""
+    if not PROMPTS_BASE_URL:
+        return None
+    if filename in _PROMPT_CACHE:
+        return _PROMPT_CACHE[filename]
+    url = f"{PROMPTS_BASE_URL}/{filename}"
+    try:
+        import requests
+        resp = requests.get(url, timeout=10, verify=verify_ssl)
+        if resp.status_code == 200 and resp.text:
+            text = resp.text.strip()
+            _PROMPT_CACHE[filename] = text
+            return text
+    except Exception:
+        pass
+    return None
+
+
 # Límite razonable de columnas para incluir en el prompt (v2 usaba 7 y cortaba 4)
 MAX_COLUMNS_IN_PROMPT = 20
 
@@ -41,8 +77,8 @@ GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 DEFAULT_COLUMNS = ["Ord", "Código", "Producto", "Detalle", "Packaging", "Un. x pack",
                   "Origen", "Cant. x bulto", "Precio de lista", "Precio NETO", "Precio NETO unitario"]
 
-# Detección: igual que v2 pero aceptando tablas con muchas columnas (encabezado oscuro/gris)
-PROMPT_DETECT_HEADERS_V3 = """Lista de precios o catálogo con tabla de productos.
+# Prompts fallback (si no se pueden cargar desde el VPS)
+_FALLBACK_DETECT_HEADERS = """Lista de precios o catálogo con tabla de productos.
 
 Estructura típica:
 - Una fila de encabezados (fondo oscuro o gris) con los nombres de cada columna.
@@ -54,14 +90,28 @@ Devuelve JSON: {"columnas": ["Nombre1", "Nombre2", ...]} con exactamente los nom
 Si no hay tabla, devuelve: {"columnas": []}"""
 
 
+def _get_prompt_detect_headers():
+    """Obtiene el prompt de detección de columnas (VPS o fallback)."""
+    text = _load_prompt("detectar_encabezados_columnas.md")
+    if text:
+        _log_prompt_source("detectar_encabezados_columnas", from_vps=True)
+        return text
+    _log_prompt_source("detectar_encabezados_columnas", from_vps=False)
+    return _FALLBACK_DETECT_HEADERS
+
+
 def _build_extract_prompt_v3(columns):
-    """Prompt V3: pide TODAS las columnas y exige "" para celdas vacías."""
+    """Prompt V3: carga desde VPS o fallback. Reemplaza {{COLUMNS_LIST}} y {{COLUMNS_OBJECT}}."""
     if not columns:
         columns = DEFAULT_COLUMNS
-    # Usar todas las columnas detectadas (hasta un máximo razonable), no solo 7
     cols_slice = columns[:MAX_COLUMNS_IN_PROMPT]
     cols_list = ", ".join(f'"{c}"' for c in cols_slice)
     obj = "{" + ", ".join(f'"{c}":"valor o vacío"' for c in cols_slice) + "}"
+    template = _load_prompt("extraer_filas_tabla.md")
+    if template:
+        _log_prompt_source("extraer_filas_tabla", from_vps=True)
+        return template.replace("{{COLUMNS_LIST}}", cols_list).replace("{{COLUMNS_OBJECT}}", obj)
+    _log_prompt_source("extraer_filas_tabla", from_vps=False)
     return f"""Extrae TODAS las filas de la tabla de esta imagen.
 
 Reglas importantes:
@@ -74,19 +124,34 @@ Reglas importantes:
 Devuelve SOLO un JSON array: [{obj}, ...] — sin texto antes ni después. [] solo si la página no tiene tabla."""
 
 
-PROMPT_RETRY_EMPTY_V3 = """Esta imagen puede contener una tabla de productos. Revisa de nuevo.
+_FALLBACK_RETRY_EMPTY = """Esta imagen puede contener una tabla de productos. Revisa de nuevo.
 
 Extrae TODAS las filas. Para cada fila devuelve TODAS las columnas que se detectaron antes (mismo orden y nombres). Si una celda está vacía, usa "".
 Devuelve SOLO un JSON array de objetos. [] solo si la página está vacía (portada, sin tabla)."""
+
+
+def _get_prompt_retry_empty():
+    """Obtiene el prompt de reintento vacío (VPS o fallback)."""
+    text = _load_prompt("reintentar_pagina_vacia.md")
+    if text:
+        _log_prompt_source("reintentar_pagina_vacia", from_vps=True)
+        return text
+    _log_prompt_source("reintentar_pagina_vacia", from_vps=False)
+    return _FALLBACK_RETRY_EMPTY
 
 
 INCOMPLETE_PAGE_THRESHOLD = 55
 
 
 def _build_retry_incomplete_prompt_v3(columns):
-    """Prompt para recuperar filas de la parte inferior; pide todas las columnas y "" si vacío."""
+    """Prompt para recuperar filas de la parte inferior. Carga desde VPS o fallback."""
     cols = columns[:MAX_COLUMNS_IN_PROMPT] if columns else DEFAULT_COLUMNS
     cols_str = ", ".join(f'"{c}"' for c in cols)
+    template = _load_prompt("reintentar_pagina_incompleta.md")
+    if template:
+        _log_prompt_source("reintentar_pagina_incompleta", from_vps=True)
+        return template.replace("{{COLUMNS_LIST}}", cols_str)
+    _log_prompt_source("reintentar_pagina_incompleta", from_vps=False)
     return f"""En esta MISMA imagen hay MÁS filas en la tabla (parte inferior). Extrae TODOS los productos de la mitad inferior.
 
 Usa exactamente estas columnas en cada objeto: {cols_str}. Si una celda está vacía, usa "".
@@ -292,7 +357,7 @@ def _detect_column_headers(pdf_path, client, num_pages=3):
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": PROMPT_DETECT_HEADERS_V3},
+                            {"type": "text", "text": _get_prompt_detect_headers()},
                             {"type": "image_url", "image_url": {"url": data_url}},
                         ],
                     }
@@ -314,11 +379,12 @@ def _detect_column_headers(pdf_path, client, num_pages=3):
     return DEFAULT_COLUMNS
 
 
-def extract_with_groq_ai_v3(pdf_path, page_numbers, debug_zero=True):
+def extract_with_groq_ai_v3(pdf_path, page_numbers, debug_zero=True, progress_callback=None):
     """
-    Extrae productos usando Groq con prompts V3: todas las columnas detectadas
-    y celdas vacías como "" (para completar Detalle, Cant. x bulto, etc.).
+    Extrae productos usando Groq con prompts V3.
+    progress_callback(opcional): función(current_page, total_pages, progress_pct, message) para reportar avance.
     """
+    _PROMPT_SOURCE_LOGGED.clear()
     api_key = (os.environ.get("GROQ_API_KEY") or "").strip().strip('"\'')
     if not api_key:
         print("   ⚠️  GROQ_API_KEY no configurada.")
@@ -332,6 +398,10 @@ def extract_with_groq_ai_v3(pdf_path, page_numbers, debug_zero=True):
 
     client = Groq(api_key=api_key)
     num_pages_pdf = max(page_numbers) if page_numbers else 3
+    total = len(page_numbers)
+
+    if progress_callback:
+        progress_callback(0, total, 0, "Detectando columnas...")
 
     print("[V3] 📋 Detectando estructura de columnas (págs. 1-3)...", flush=True)
     sys.stdout.flush()
@@ -339,7 +409,6 @@ def extract_with_groq_ai_v3(pdf_path, page_numbers, debug_zero=True):
     extract_prompt = _build_extract_prompt_v3(columns)
 
     all_products = []
-    total = len(page_numbers)
 
     for i, page_num in enumerate(page_numbers, 1):
         print(f"[V3] 📄 Página {page_num} [{i}/{total}] → Enviando a API...", flush=True)
@@ -377,7 +446,7 @@ def extract_with_groq_ai_v3(pdf_path, page_numbers, debug_zero=True):
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": PROMPT_RETRY_EMPTY_V3},
+                                {"type": "text", "text": _get_prompt_retry_empty()},
                                 {"type": "image_url", "image_url": {"url": data_url}},
                             ],
                         }
@@ -419,6 +488,9 @@ def extract_with_groq_ai_v3(pdf_path, page_numbers, debug_zero=True):
 
             print(f"[V3] ✓ Página {page_num}: {len(products)} productos", flush=True)
             sys.stdout.flush()
+            if progress_callback:
+                pct = int((i / total) * 100) if total else 0
+                progress_callback(i, total, pct, f"Página {i}/{total}")
         except Exception as e:
             print(f"[V3] ❌ Página {page_num} Error: {e}", flush=True)
             sys.stdout.flush()
