@@ -51,10 +51,16 @@ En el servidor se configura `PDF2XLS_API_KEY` en `.env`; la misma clave la usa l
 
 ---
 
+## Despliegue (Gunicorn + systemd, puerto 8090)
+
+Para producción con Gunicorn y un servicio systemd, ver **[DEPLOY.md](DEPLOY.md)**. Incluye `deploy/pdf2xls.service` y pasos para instalar, habilitar y usar el servicio.
+
 ## Estructura del proyecto
 
 - `app.py` – Flask: rutas `/convert-v3` y `/convert-retab`, filtrado de filas para Retab.
 - `pdf_converter_ai_v3.py` – Extracción con Groq: detección de columnas y extracción por página (todas las columnas, celdas vacías como `""`).
+- `gunicorn.conf.py` – Configuración de Gunicorn (bind 0.0.0.0:8090 por defecto).
+- `deploy/pdf2xls.service` – Unit systemd para instalar en `/etc/systemd/system/`.
 
 ---
 

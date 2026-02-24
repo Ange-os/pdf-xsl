@@ -24,3 +24,5 @@ __pycache__/
  __pycache__
  GEMINI_API_KEY.md
  test_converter.py 
+ GEMINI_API_KEY.md
+ test_converter.py
