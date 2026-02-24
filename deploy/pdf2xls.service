@@ -1,0 +1,29 @@
+[Unit]
+Description=PDF2XLS - Conversión PDF a Excel (Gunicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+
+# Ruta de la aplicación (ajustar si despliegas en otro directorio)
+WorkingDirectory=/opt/startup/pdf2xls
+EnvironmentFile=/opt/startup/pdf2xls/.env
+
+# Gunicorn en el puerto 8090
+ExecStart=/opt/startup/pdf2xls/venv/bin/gunicorn -c gunicorn.conf.py app:app
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+# Seguridad
+NoNewPrivileges=true
+PrivateTmp=true
+ReadWritePaths=/opt/startup/pdf2xls
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target
