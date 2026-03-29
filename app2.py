@@ -179,24 +179,7 @@ def _v3_df_to_excel_single_sheet(df):
 
 @app.route("/")
 def root():
-    return jsonify(
-        {
-            "service": "pdf2xls-api",
-            "backend": "app2",
-            "endpoints": {
-                "convert_v3": "POST /convert-v3",
-                "job_create": "POST /convert-v3/job",
-                "job_status": "GET /convert-v3/job/<id>/status",
-                "job_result": "GET /convert-v3/job/<id>/result",
-                "prompts_list": "GET /prompts",
-                "prompts_v3_by_slug": "GET|PUT /prompts/v/<slug> (slugs en PROMPT_SLUGS)",
-                "prompt_get_file": "GET /prompts/<file.md>",
-                "prompt_put_file": "PUT /prompts/<file.md>",
-                "deploy": "POST /deploy (header X-Deploy-Token, requiere DEPLOY_SECRET)",
-            },
-            "prompt_slugs": list(PROMPT_SLUGS.keys()),
-        }
-    )
+    return "pdf2xsl", 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/health")
