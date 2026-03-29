@@ -11,9 +11,11 @@ try:
 except ImportError:
     pass
 
+import hmac
 import io
 import os
 import re
+import subprocess
 from typing import Optional
 import tempfile
 import threading
@@ -54,6 +56,8 @@ CORS(
 
 # API Key para endpoints protegidos (jobs + prompts)
 PDF2XLS_API_KEY = (os.environ.get("PDF2XLS_API_KEY") or "").strip().strip('"\'')
+# Deploy: POST /deploy con header X-Deploy-Token (ver DEPLOY_SECRET en .env)
+DEPLOY_SECRET = (os.environ.get("DEPLOY_SECRET") or "").strip()
 _JOBS = {}
 _JOBS_LOCK = threading.Lock()
 
@@ -67,6 +71,14 @@ PROMPT_SLUGS = {
     "reintentar-pagina-vacia": "reintentar_pagina_vacia.md",
     "reintentar-pagina-incompleta": "reintentar_pagina_incompleta.md",
 }
+
+
+def _deploy_repo_path() -> Path:
+    """Raíz del repo para `git pull`. DEPLOY_REPO_PATH en .env o carpeta de app2.py."""
+    raw = (os.environ.get("DEPLOY_REPO_PATH") or "").strip()
+    if raw:
+        return Path(raw).resolve()
+    return Path(__file__).resolve().parent
 
 
 def _require_api_key():
@@ -180,6 +192,7 @@ def root():
                 "prompts_v3_by_slug": "GET|PUT /prompts/v/<slug> (slugs en PROMPT_SLUGS)",
                 "prompt_get_file": "GET /prompts/<file.md>",
                 "prompt_put_file": "PUT /prompts/<file.md>",
+                "deploy": "POST /deploy (header X-Deploy-Token, requiere DEPLOY_SECRET)",
             },
             "prompt_slugs": list(PROMPT_SLUGS.keys()),
         }
@@ -189,6 +202,62 @@ def root():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"}), 200
+
+
+@app.route("/deploy", methods=["POST"])
+def deploy():
+    """
+    git pull en el VPS + reinicio del servicio systemd (Gunicorn).
+    Requiere DEPLOY_SECRET en .env y cabecera X-Deploy-Token con el mismo valor.
+    El restart usa Popen para que la respuesta HTTP se envíe antes de que muera el worker.
+    """
+    token = request.headers.get("X-Deploy-Token", "")
+    if not DEPLOY_SECRET or not hmac.compare_digest(token, DEPLOY_SECRET):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    repo = _deploy_repo_path()
+    unit = (os.environ.get("DEPLOY_SYSTEMD_UNIT") or "pdf2xls.service").strip()
+    if not unit or any(c in unit for c in ("/", "\\", "..")):
+        return jsonify({"error": "DEPLOY_SYSTEMD_UNIT inválido"}), 500
+
+    try:
+        pull = subprocess.run(
+            ["git", "pull"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if pull.returncode != 0:
+            return (
+                jsonify(
+                    {
+                        "error": "git pull falló",
+                        "stderr": (pull.stderr or "")[:8000],
+                        "stdout": (pull.stdout or "")[:8000],
+                    }
+                ),
+                500,
+            )
+
+        popen_kw = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if os.name != "nt":
+            popen_kw["start_new_session"] = True
+        subprocess.Popen(["sudo", "systemctl", "restart", unit], **popen_kw)
+
+        return jsonify(
+            {
+                "ok": True,
+                "git": pull.stdout or "",
+                "note": "reiniciando servicio…",
+                "unit": unit,
+            }
+        )
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Timeout en git pull"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/convert-v3", methods=["POST"])
