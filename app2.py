@@ -225,7 +225,10 @@ def deploy():
         popen_kw = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
         if os.name != "nt":
             popen_kw["start_new_session"] = True
-        subprocess.Popen(["sudo", "-n", "/opt/startup/pdf2xls/venv/bin/gunicorn", "-c", "gunicorn.conf.py", "app2:app"],**popen_kw)
+        subprocess.Popen(
+            ["sudo", "-n", "/bin/systemctl", "restart", "--no-block", "pdf2xls.service"],
+            start_new_session=True,
+        )
 
         return jsonify(
             {
