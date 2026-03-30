@@ -179,8 +179,8 @@ def _v3_df_to_excel_single_sheet(df):
 
 @app.route("/")
 def home():
-    return "daleeeeeeeeeeeeeeeee", 200, {"Content-Type": "text/plain; charset=utf-8"}
-
+    return_string = "daleeeeeeeeeeeeeeeee"
+    return return_string, 200, {"Content-Type": "text/plain; charset=utf-8"}
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"}), 200
@@ -227,10 +227,6 @@ def deploy():
             popen_kw["start_new_session"] = True
         subprocess.Popen(
                 ["sudo", "-n", "/bin/systemctl", "stop", "pdf2xls.service"],
-            )
-            time.sleep(2)
-            subprocess.Popen(
-                ["sudo", "-n", "/bin/systemctl", "start", "pdf2xls.service"],
             )
 
         return jsonify(
