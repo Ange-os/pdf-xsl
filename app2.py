@@ -200,7 +200,7 @@ def deploy():
 
     repo = _deploy_repo_path()
     unit = (os.environ.get("DEPLOY_SYSTEMD_UNIT") or "pdf2xls.service").strip()
-    if not unit or any(c in unit for c in ("/", "\\", "..")):
+    if not unit or not re.fullmatch(r"[a-zA-Z0-9_\-]+\.service", unit):
         return jsonify({"error": "DEPLOY_SYSTEMD_UNIT inválido"}), 500
 
     try:
