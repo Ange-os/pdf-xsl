@@ -226,9 +226,12 @@ def deploy():
         if os.name != "nt":
             popen_kw["start_new_session"] = True
         subprocess.Popen(
-            ["sudo", "-n", "/bin/systemctl", "restart", "--no-block", "pdf2xls.service"],
-            start_new_session=True,
-        )
+                ["sudo", "-n", "/bin/systemctl", "stop", "pdf2xls.service"],
+            )
+            time.sleep(2)
+            subprocess.Popen(
+                ["sudo", "-n", "/bin/systemctl", "start", "pdf2xls.service"],
+            )
 
         return jsonify(
             {
